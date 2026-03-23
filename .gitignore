@@ -1,0 +1,16 @@
+# Environment & secrets — JANGAN commit file ini!
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+venv/
+/venv
+
+# Streamlit cache
+.streamlit/
+
+# macOS
+.DS_Store

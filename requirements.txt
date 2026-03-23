@@ -1,0 +1,17 @@
+# Polymarket Arbitrage Bot — Dependencies
+# Install: pip install -r requirements.txt
+
+# HTTP requests dengan auto-retry
+requests>=2.31.0
+urllib3>=2.0.0
+
+# Baca file .env secara otomatis
+python-dotenv>=1.0.0
+
+# Web UI
+streamlit>=1.35.0
+pandas>=2.0.0
+
+# Polymarket Official SDK (untuk eksekusi order live)
+# Uncomment + install manual dari GitHub jika ingin live trading:
+# pip install git+https://github.com/Polymarket/py-clob-client.git
