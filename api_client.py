@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Optional
 
 import requests
@@ -98,10 +99,22 @@ def _parse_json_field(value, fallback):
 # Gamma API — Market discovery
 # ─────────────────────────────────────────────
 
-def fetch_active_markets(query: str = "", limit: int = 150) -> list[dict]:
+def _is_expired(market: dict) -> bool:
+    """Return True jika market sudah melewati endDate-nya."""
+    end_str = market.get("endDate", "")
+    if not end_str:
+        return False
+    try:
+        end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+        return end_dt < datetime.now(timezone.utc)
+    except Exception:
+        return False
+
+
+def fetch_active_markets(query: str = "", limit: int = 200) -> list[dict]:
     """
-    Ambil markets aktif, diurutkan berdasarkan volume24hr.
-    Gunakan `query` untuk filter API-side (q=...), lalu filter ulang client-side.
+    Ambil markets aktif dengan CLOB liquidity, diurutkan berdasarkan volume24hr.
+    Filter client-side: buang yang expired atau tidak punya liquidity di CLOB.
     """
     params: dict = {
         "active":    "true",
@@ -113,7 +126,9 @@ def fetch_active_markets(query: str = "", limit: int = 150) -> list[dict]:
     if query.strip():
         params["q"] = query.strip()
     try:
-        return _as_list(_get(f"{GAMMA_BASE_URL}/markets", params))
+        all_markets = _as_list(_get(f"{GAMMA_BASE_URL}/markets", params))
+        # Filter: buang yang sudah expired saja — liquidityClob di Gamma sering stale/tidak akurat
+        return [m for m in all_markets if not _is_expired(m)]
     except Exception as exc:
         logger.warning("Gagal ambil markets: %s", exc)
         return []
@@ -122,7 +137,7 @@ def fetch_active_markets(query: str = "", limit: int = 150) -> list[dict]:
 def group_markets_by_event(markets: list[dict], query: str = "") -> dict[str, dict]:
     """
     Kelompokkan markets berdasarkan parent event (dari field events[0].id).
-    Hanya tampilkan event dengan 2+ binary market (multi-outcome).
+    Hanya tampilkan event dengan 2+ binary market yang masih aktif.
     """
     q = query.strip().lower()
 
@@ -142,7 +157,7 @@ def group_markets_by_event(markets: list[dict], query: str = "") -> dict[str, di
         if not ev_id:
             continue
 
-        # Client-side filter: cari di judul event atau pertanyaan market
+        # Client-side filter teks
         if q:
             haystack = (ev_title + " " + m.get("question", "")).lower()
             if q not in haystack:
@@ -150,15 +165,19 @@ def group_markets_by_event(markets: list[dict], query: str = "") -> dict[str, di
 
         if ev_id not in groups:
             groups[ev_id] = {
-                "title":    ev_title,
-                "slug":     ev_slug,
-                "markets":  [],
+                "title":     ev_title,
+                "slug":      ev_slug,
+                "markets":   [],
                 "volume24h": 0.0,
+                "end_date":  m.get("endDate", ""),
             }
         groups[ev_id]["markets"].append(m)
         groups[ev_id]["volume24h"] = max(
             groups[ev_id]["volume24h"], m.get("volume24hr", 0)
         )
+        # Simpan endDate terbaru (terlama) dalam grup
+        if m.get("endDate", "") > groups[ev_id]["end_date"]:
+            groups[ev_id]["end_date"] = m.get("endDate", "")
 
     # Hanya event multi-outcome (≥2 binary market)
     return {k: v for k, v in groups.items() if len(v["markets"]) >= 2}
@@ -168,28 +187,26 @@ def group_markets_by_event(markets: list[dict], query: str = "") -> dict[str, di
 # Gamma API — Market info
 # ─────────────────────────────────────────────
 
-def _get_event_markets(event_id: str) -> tuple[str, str, list[dict]]:
-    """
-    Ambil semua binary market dari GET /events/{id}.
-    Return: (event_title, event_slug, list_of_markets)
-    """
+def _fetch_event_meta(event_id: str) -> tuple[str, str]:
+    """Ambil title & slug event dari GET /events/{id}."""
     try:
-        event_data = _get(f"{GAMMA_BASE_URL}/events/{event_id}")
-        title   = event_data.get("title", "")
-        slug    = event_data.get("slug", "")
-        markets = event_data.get("markets", [])
-        return title, slug, markets
+        data = _get(f"{GAMMA_BASE_URL}/events/{event_id}")
+        return data.get("title", ""), data.get("slug", "")
     except Exception as exc:
         logger.warning("Gagal ambil /events/%s: %s", event_id, exc)
-        return "", "", []
+        return "", ""
 
 
 def get_market_info(condition_id: str) -> MarketInfo:
     """
     Ambil semua outcome untuk satu event berdasarkan condition_id salah satu market-nya.
-    Menggunakan GET /events/{id} untuk mendapatkan semua binary market dalam event.
+
+    Strategi pencarian sibling markets (berurutan hingga berhasil):
+    A) GET /markets?eventId={id}  → full market objects lengkap dengan clobTokenIds
+    B) Validasi: hanya market yang benar-benar ada di event ini (cek events[0].id)
+    C) Fallback: gunakan initial market saja jika semua gagal
     """
-    # 1. Fetch market awal → cari parent event ID
+    # 1. Fetch market awal untuk mendapatkan event ID
     initial_data = _as_list(_get(
         f"{GAMMA_BASE_URL}/markets",
         {"conditionId": condition_id, "limit": 1}
@@ -199,49 +216,95 @@ def get_market_info(condition_id: str) -> MarketInfo:
 
     initial      = initial_data[0]
     events_field = initial.get("events", [])
-    event_id     = events_field[0].get("id", "") if events_field else ""
+    event_id     = str(events_field[0].get("id", "")) if events_field else ""
 
-    # 2. Ambil semua binary market via GET /events/{id}
+    # 2. Ambil title & slug event
     if event_id:
-        event_title, event_slug, binary_markets = _get_event_markets(event_id)
-        if not binary_markets:
-            binary_markets = [initial]
+        event_title, event_slug = _fetch_event_meta(event_id)
     else:
-        event_title  = ""
-        event_slug   = ""
-        binary_markets = [initial]
+        event_title = ""
+        event_slug  = ""
 
     question = event_title or initial.get("question", "Unknown Market")
-    logger.info("Event '%s' — %d binary market ditemukan.", question, len(binary_markets))
 
-    # 3. Build outcomes
+    # 3. Ambil semua sibling markets via /markets?eventId=... (format lengkap + clobTokenIds)
+    siblings: list[dict] = []
+    if event_id:
+        try:
+            candidates = _as_list(_get(
+                f"{GAMMA_BASE_URL}/markets",
+                {"eventId": event_id, "active": "true", "closed": "false", "limit": 100}
+            ))
+            # Validasi: hanya market yang events[0].id cocok dengan event ini
+            siblings = [
+                m for m in candidates
+                if any(str(e.get("id")) == event_id for e in m.get("events", []))
+            ]
+            logger.info("eventId=%s → %d/%d sibling valid.", event_id, len(siblings), len(candidates))
+        except Exception as exc:
+            logger.warning("Gagal ambil sibling markets: %s", exc)
+
+    # Fallback ke initial market jika tidak ada siblings valid
+    if not siblings:
+        siblings = [initial]
+
+    # 4. Build outcomes
     outcomes: list[OutcomeInfo] = []
-    for m in binary_markets:
-        if m.get("closed", False) or not m.get("active", True):
-            continue
-        if not m.get("enableOrderBook", True):
-            continue
-
+    for m in siblings:
         tokens = _parse_json_field(m.get("clobTokenIds"), [])
         if len(tokens) < 2:
+            logger.debug("Market %s tidak punya clobTokenIds, dilewati.", m.get("id"))
             continue
 
-        # Label outcome yang bermakna:
-        # Prioritas: groupItemTitle > pertanyaan market (diperpendek)
-        group_title = m.get("groupItemTitle", "")
-        mq          = m.get("question", "")
-        outcome_label = group_title or mq[:60] or "Unknown"
-
+        # Label: groupItemTitle (misal "March 31", "0-50") > question market
+        outcome_label = (
+            m.get("groupItemTitle")
+            or m.get("question", "Unknown")[:60]
+        )
         outcomes.append(OutcomeInfo(
             outcome_label=outcome_label,
             yes_token_id=tokens[0],
             no_token_id=tokens[1],
         ))
 
-    logger.info("Total %d outcome valid.", len(outcomes))
+    logger.info("Total %d outcome valid untuk '%s'.", len(outcomes), question)
     return MarketInfo(
         condition_id=condition_id,
         question=question,
+        event_slug=event_slug,
+        outcomes=outcomes,
+    )
+
+
+def build_market_info(
+    markets: list[dict],
+    event_title: str,
+    event_slug: str,
+    condition_id: str,
+) -> MarketInfo:
+    """
+    Build MarketInfo langsung dari list market yang sudah di-fetch UI.
+    Digunakan untuk menghindari re-fetch sibling via eventId yang tidak reliable.
+    """
+    outcomes: list[OutcomeInfo] = []
+    for m in markets:
+        tokens = _parse_json_field(m.get("clobTokenIds"), [])
+        if len(tokens) < 2:
+            logger.debug("Market %s tidak punya clobTokenIds, dilewati.", m.get("id"))
+            continue
+        outcome_label = (
+            m.get("groupItemTitle")
+            or m.get("question", "Unknown")[:60]
+        )
+        outcomes.append(OutcomeInfo(
+            outcome_label=outcome_label,
+            yes_token_id=tokens[0],
+            no_token_id=tokens[1],
+        ))
+    logger.info("build_market_info: %d outcome dari %d market.", len(outcomes), len(markets))
+    return MarketInfo(
+        condition_id=condition_id,
+        question=event_title,
         event_slug=event_slug,
         outcomes=outcomes,
     )

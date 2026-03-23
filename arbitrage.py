@@ -114,15 +114,21 @@ def _analyze_no_strategy(
     """
     n = len(outcome_prices)
     valid = [op for op in outcome_prices if op.no_ask is not None]
+    n_covered = len(valid)
 
-    if len(valid) < n:
-        missing = n - len(valid)
-        logger.warning("%d outcome tidak punya harga NO, skip strategi NO.", missing)
+    if n_covered < n:
+        logger.warning(
+            "%d/%d outcome tidak punya harga NO — payout dihitung dari %d yang bisa dibeli.",
+            n - n_covered, n, n_covered,
+        )
 
+    # Payout dihitung dari outcome yang BENAR-BENAR bisa dibeli.
+    # Worst case: 1 dari n_covered menang → (n_covered - 1) NO token bayar $1.
+    # (Jika outcome yang tidak tercover menang, payout justru lebih tinggi = n_covered × $1)
     total_cost = sum(op.no_ask * BET_SIZE_SHARES for op in valid)  # type: ignore[operator]
-    guaranteed_payout = (n - 1) * BET_SIZE_SHARES
+    guaranteed_payout = (n_covered - 1) * BET_SIZE_SHARES
     gross_profit = guaranteed_payout - total_cost
-    total_gas = GAS_FEE_PER_TX * n
+    total_gas = GAS_FEE_PER_TX * n_covered
     net_profit = gross_profit - total_gas
     roi = (net_profit / total_cost * 100) if total_cost > 0 else 0.0
 
@@ -153,11 +159,23 @@ def _analyze_yes_strategy(
     """
     n = len(outcome_prices)
     valid = [op for op in outcome_prices if op.yes_ask is not None]
+    n_covered = len(valid)
+
+    # YES strategy: tepat 1 menang → payout $1 HANYA jika kamu hold YES token yang menang.
+    # Jika ada outcome tanpa harga (tidak dibeli), dan outcome itu menang → payout $0.
+    # Jadi guaranteed_payout = $1 hanya jika SEMUA outcome tercover.
+    if n_covered < n:
+        logger.warning(
+            "%d/%d outcome tidak punya harga YES — strategi YES tidak lengkap.",
+            n - n_covered, n,
+        )
+        guaranteed_payout = 0.0  # tidak bisa guarantee profit jika ada yang missing
+    else:
+        guaranteed_payout = 1.0 * BET_SIZE_SHARES
 
     total_cost = sum(op.yes_ask * BET_SIZE_SHARES for op in valid)  # type: ignore[operator]
-    guaranteed_payout = 1.0 * BET_SIZE_SHARES
     gross_profit = guaranteed_payout - total_cost
-    total_gas = GAS_FEE_PER_TX * n
+    total_gas = GAS_FEE_PER_TX * n_covered
     net_profit = gross_profit - total_gas
     roi = (net_profit / total_cost * 100) if total_cost > 0 else 0.0
 
@@ -176,18 +194,25 @@ def _analyze_yes_strategy(
     )
 
 
-def check_arbitrage(condition_id: str) -> tuple[ArbitrageResult, ArbitrageResult]:
+def check_arbitrage(
+    condition_id: str,
+    market_info: Optional[MarketInfo] = None,
+) -> tuple[ArbitrageResult, ArbitrageResult]:
     """
     Fungsi utama: periksa peluang arbitrase (NO & YES) untuk satu market.
 
     Args:
-        condition_id: Polymarket condition ID (0x...).
+        condition_id:  Polymarket condition ID (0x...).
+        market_info:   Jika sudah tersedia (dari UI), langsung dipakai — skip re-fetch.
 
     Returns:
         Tuple (no_result, yes_result) — dua objek ArbitrageResult.
     """
-    logger.info("Mengambil data market: %s", condition_id)
-    market = get_market_info(condition_id)
+    if market_info is not None:
+        market = market_info
+    else:
+        logger.info("Mengambil data market: %s", condition_id)
+        market = get_market_info(condition_id)
 
     if not market.outcomes:
         raise ValueError("Market tidak memiliki outcome yang valid.")

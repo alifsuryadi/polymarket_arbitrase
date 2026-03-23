@@ -8,9 +8,9 @@ import streamlit as st
 import pandas as pd
 
 from arbitrage import check_arbitrage
-from api_client import fetch_active_markets, group_markets_by_event
+from api_client import fetch_active_markets, group_markets_by_event, build_market_info, MarketInfo
 from paper_trade import PaperPortfolio, simulate_trade
-from config import POLL_INTERVAL_SECONDS, PROFIT_THRESHOLD
+from config import POLL_INTERVAL_SECONDS, PROFIT_THRESHOLD, BET_SIZE_SHARES
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -70,17 +70,35 @@ for k, v in [
         st.session_state[k] = v
 
 
-# ─── Data fetch (dengan double-cache: API + client filter) ────────────────────
-@st.cache_data(ttl=30, show_spinner=False)
+# ─── Data fetch ───────────────────────────────────────────────────────────────
+@st.cache_data(ttl=60, show_spinner=False)
 def _cached_markets(limit: int) -> list[dict]:
-    """Fetch 150 market aktif terbaru — di-cache tanpa filter agar bisa refilter client-side."""
+    """Fetch market aktif terbaru — di-cache 60 detik."""
     return fetch_active_markets(query="", limit=limit)
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _search_markets(query: str, limit: int) -> list[dict]:
+    """Fetch dengan server-side search — di-cache per query."""
+    return fetch_active_markets(query=query, limit=limit)
+
+
 def get_grouped_markets(query: str) -> dict[str, dict]:
-    """Grouping + client-side search dari cache markets."""
-    all_markets = _cached_markets(150)
-    return group_markets_by_event(all_markets, query=query)
+    """
+    Grouping + search.
+    Jika ada query: gabungkan hasil server-search (limit 500) + top-200 umum,
+    lalu filter client-side. Ini memastikan market populer (trump, dll) tetap
+    muncul meski server-search API tidak mengembalikan semua sub-market.
+    """
+    if query.strip():
+        search_res = _search_markets(query.strip(), 500)
+        general    = _cached_markets(200)
+        # Merge — server search duluan, tambahkan dari general yang belum ada
+        seen   = {m.get("conditionId") for m in search_res if m.get("conditionId")}
+        merged = search_res + [m for m in general if m.get("conditionId") not in seen]
+        return group_markets_by_event(merged, query=query)
+    else:
+        return group_markets_by_event(_cached_markets(200))
 
 
 def polymarket_url(slug: str) -> str:
@@ -106,27 +124,36 @@ def render_result_card(result) -> None:
              if (op.no_ask if result.strategy == "NO" else op.yes_ask) is not None]
 
     if not valid:
-        st.markdown('<div class="warn">⚠️ Tidak ada harga aktif. Market mungkin sudah selesai atau tidak likuid.</div>',
-                    unsafe_allow_html=True)
+        st.markdown("""
+<div class="warn">
+  ⚠️ <b>Tidak ada harga aktif untuk strategi ini.</b><br>
+  Coba: pilih event lain yang <b>belum berakhir</b>, atau cari periode yang lebih baru
+  (contoh: "elon musk march 31").
+</div>
+""", unsafe_allow_html=True)
         return
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Cost",        f"${result.total_cost:.2f}")
-    c2.metric("Guaranteed Payout", f"${result.guaranteed_payout:.2f}")
-    c3.metric("Net Profit",        f"${result.net_profit:.2f}",
+    c1.metric("Total Modal",        f"${result.total_cost:.2f}")
+    c2.metric("Guaranteed Payout",  f"${result.guaranteed_payout:.2f}")
+    c3.metric("Net Profit",         f"${result.net_profit:.2f}",
               delta=f"{result.roi_pct:.2f}% ROI",
-              delta_color="normal" if result.net_profit > 0 else "inverse")
-    c4.metric("Gas Fee",           f"${result.total_gas_fee:.2f}")
+              delta_color="normal")   # normal: negatif = merah, positif = hijau
+    c4.metric("Gas Fee",            f"${result.total_gas_fee:.2f}")
 
-    # ── Tabel per outcome dengan nama kategori ──
+    # ── Tabel per outcome ──
+    payout_per_share = BET_SIZE_SHARES  # $1.00 per share jika NO/YES menang
     rows = []
     for op in result.outcome_prices:
-        ask = op.no_ask if result.strategy == "NO" else op.yes_ask
+        ask   = op.no_ask if result.strategy == "NO" else op.yes_ask
+        modal = ask * BET_SIZE_SHARES if ask else None
+        laba  = (payout_per_share - modal) if modal is not None else None
         rows.append({
-            "Kategori / Outcome":  op.outcome.outcome_label,
-            f"Ask ({result.strategy})": f"${ask:.2f}" if ask else "—",
-            "Cost (1 share)":      f"${ask:.2f}" if ask else "—",
-            "Liquidity":           "✅" if ask else "❌",
+            "Kategori / Outcome": op.outcome.outcome_label,
+            "Modal":              f"${modal:.2f}" if modal is not None else "—",
+            "Terima (gross)":     f"${payout_per_share:.2f}" if modal is not None else "—",
+            "Laba bersih leg":    (f"+${laba:.2f}" if laba >= 0 else f"-${abs(laba):.2f}") if laba is not None else "—",
+            "Status":             "✅ Tersedia" if ask else "❌ Kosong",
         })
     st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
@@ -192,6 +219,7 @@ with st.sidebar:
     input_mode = st.radio("Cara input:", ["Cari dari Polymarket", "Manual (Condition ID)"], index=0)
 
     condition_id = ""
+    market_info_override: MarketInfo | None = None
 
     if input_mode == "Manual (Condition ID)":
         condition_id = st.text_input("Condition ID", placeholder="0x1234abcd...")
@@ -213,11 +241,21 @@ with st.sidebar:
 
             options_map = {}
             for ev_id, ev_data in sorted_groups:
-                title  = ev_data["title"][:65]
+                title  = ev_data["title"][:60]
                 vol    = ev_data["volume24h"]
                 n_out  = len(ev_data["markets"])
                 vol_s  = f"${vol/1000:.0f}k" if vol >= 1000 else f"${vol:.0f}"
-                label  = f"{title}  [{n_out} outcomes · {vol_s}/24h]"
+                # Tampilkan tanggal berakhir jika ada
+                end_s  = ""
+                end_raw = ev_data.get("end_date", "")
+                if end_raw:
+                    try:
+                        from datetime import datetime, timezone
+                        ed = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
+                        end_s = f" · ends {ed.strftime('%b %d')}"
+                    except Exception:
+                        pass
+                label  = f"{title}  [{n_out} outcomes · {vol_s}/24h{end_s}]"
                 options_map[label] = ev_data
 
             selected_label = st.selectbox(
@@ -239,6 +277,14 @@ with st.sidebar:
                 n_out = len(selected_group["markets"])
                 st.success(f"✅ {n_out} outcome ditemukan")
                 st.code(condition_id[:42], language=None)
+                # Build MarketInfo langsung dari data yang sudah kita punya
+                # → hindari re-fetch sibling yang bisa salah market
+                market_info_override = build_market_info(
+                    markets=selected_group["markets"],
+                    event_title=ev_title_local,
+                    event_slug=ev_slug_local,
+                    condition_id=condition_id,
+                )
         else:
             if search_query:
                 st.warning(f'Tidak ada hasil untuk "{search_query}"')
@@ -305,7 +351,7 @@ if not condition_id:
 def do_scan():
     with st.spinner("Mengambil data orderbook real-time..."):
         try:
-            no_result, yes_result = check_arbitrage(condition_id)
+            no_result, yes_result = check_arbitrage(condition_id, market_info=market_info_override)
             st.session_state.current_result = (no_result, yes_result)
             st.session_state.scan_history.insert(0, {
                 "time":       time.strftime("%H:%M:%S"),
@@ -365,8 +411,14 @@ if result_pair:
         st.markdown(f'<div class="opp">🚨 <b>OPPORTUNITY FOUND!</b> &nbsp; Buy All <b>{best.strategy}</b> &nbsp;|&nbsp; Net: <b>${best.net_profit:.2f}</b> &nbsp;|&nbsp; ROI: <b>{best.roi_pct:.2f}%</b></div>',
                     unsafe_allow_html=True)
     elif n_valid == 0:
-        st.markdown('<div class="warn">⚠️ Tidak ada harga aktif. Pilih market lain yang masih diperdagangkan.</div>',
-                    unsafe_allow_html=True)
+        st.markdown(f"""
+<div class="warn">
+  ⚠️ <b>Semua token 404 — orderbook tidak aktif.</b><br>
+  Market ini kemungkinan <b>sudah expired atau belum ada liquidity</b>.
+  Cari event yang lebih baru di sidebar (contoh: tambahkan tanggal lebih jauh seperti
+  <code>elon musk march 31</code> atau <code>elon musk april</code>).
+</div>
+""", unsafe_allow_html=True)
     else:
         st.markdown('<div class="nopp">⏳ Tidak ada peluang arbitrase saat ini.</div>', unsafe_allow_html=True)
 
