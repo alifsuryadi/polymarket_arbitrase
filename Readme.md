@@ -1,43 +1,115 @@
-# Proyek: Polymarket Internal Arbitrage Bot
+# Polymarket Internal Arbitrage Bot
 
-## Deskripsi
-Bot ini dirancang untuk mencari inefisiensi harga pada market dengan hasil banyak (Multi-Outcome) di Polymarket. Bot berfokus pada strategi **"Buy All No"** atau **"Buy All Yes"**.
-
----
-
-## Spesifikasi Teknis
-- **Bahasa:** Python 3.9+
-- **API Target:** [Polymarket CLOB API](https://docs.polymarket.com/)
-- **Network:** Polygon Mainnet
-- **Asset:** USDC
+A Python-based arbitrage bot designed to detect and exploit price inefficiencies in multi-outcome markets on [Polymarket](https://polymarket.com/). The bot implements two primary strategies: "Buy All NO" and "Buy All YES".
 
 ---
 
-## Logika Matematika Arbitrase
+## 🚀 Key Features
 
-### 1. Strategi "No" Arbitrage
-Kondisi di mana kita membeli opsi 'No' di semua hasil yang mungkin.
-- $n$ = Jumlah total kategori/outcome.
-- $C_{no}$ = Harga beli (Ask) untuk opsi No.
-- **Rumus Profit:** $P = (n - 1) - \sum_{i=1}^{n} C_{no,i}$
-- **Eksekusi:** Jika $P > \text{Threshold (misal 0.01 USD)}$, maka jalankan order.
-
-### 2. Strategi "Yes" Arbitrage
-Kondisi di mana total harga semua opsi 'Yes' di bawah $1.00.
-- $C_{yes}$ = Harga beli (Ask) untuk opsi Yes.
-- **Rumus Profit:** $P = 1.00 - \sum_{i=1}^{n} C_{yes,i}$
+- **Real-time Monitoring**: Scans orderbooks for specific `condition_id` to find arbitrage opportunities.
+- **ROI Calculation**: Automatically calculates net profit, including estimated Polygon gas fees.
+- **Paper Trading Mode**: Simulate trades with a virtual portfolio to test strategies without risking real assets.
+- **Live Trading**: Execute real orders on the Polygon Mainnet using the Polymarket CLOB API.
+- **Web UI**: User-friendly dashboard built with Streamlit for monitoring and analysis.
+- **Flexible Configuration**: Easily adjust profit thresholds, bet sizes, and polling intervals.
 
 ---
 
-## Rencana Pengembangan (Roadmap)
-1. **Fase 1:** Script monitoring harga real-time (Read-only).
-2. **Fase 2:** Kalkulator ROI otomatis termasuk estimasi Gas Fee Polygon.
-3. **Fase 3:** Integrasi Wallet (Private Key) untuk eksekusi order otomatis via API.
-4. **Fase 4:** Pengamanan (Stop-loss) jika salah satu order gagal tereksekusi (Partial Fill).
+## 📈 Arbitrage Strategies
+
+### 1. "Buy All NO" Strategy
+This strategy is used when the sum of the 'NO' prices across all possible outcomes is less than $(n-1)$, where $n$ is the number of outcomes.
+- **Formula**: $Profit = (n - 1) - \sum_{i=1}^{n} Price_{NO,i}$
+
+### 2. "Buy All YES" Strategy
+This strategy is used when the sum of the 'YES' prices for all outcomes is less than $1.00.
+- **Formula**: $Profit = 1.00 - \sum_{i=1}^{n} Price_{YES,i}$
 
 ---
 
-## Peringatan Risiko
-- **Slippage:** Harga bisa berubah saat bot sedang melakukan eksekusi beruntun.
-- **Likuiditas:** Pastikan volume di orderbook cukup untuk ukuran taruhan Anda.
-- **Execution Risk:** Jika 11 order 'No' berhasil tapi 1 order gagal, strategi arbitrase rusak.
+## 🛠 Project Structure
+
+- `main.py`: The main entry point for CLI-based monitoring and execution.
+- `ui.py`: Streamlit-based web interface for visual monitoring.
+- `arbitrage.py`: Core logic for fetching orderbook data and calculating arbitrage opportunities.
+- `api_client.py`: Handles raw HTTP requests to the Polymarket CLOB API.
+- `executor.py`: Logic for executing live trades and dry-run simulations.
+- `paper_trade.py`: Implements virtual portfolio and trade simulation for testing.
+- `config.py`: Configuration management and environment variable loading.
+
+---
+
+## ⚙️ Installation & Setup
+
+### 1. Prerequisites
+- Python 3.9 or higher.
+- A Polygon wallet with USDC for live trading (optional).
+
+### 2. Install Dependencies
+Clone the repository and install the required Python packages:
+
+```bash
+git clone https://github.com/alifsuryadi/polymarket_arbitrase.git
+cd polymarket_arbitrase
+pip install -r requirements.txt
+```
+
+### 3. (Optional) Install Polymarket SDK
+If you plan to use **Live Trading** mode, you must install the official Polymarket CLOB client:
+
+```bash
+pip install git+https://github.com/Polymarket/py-clob-client.git
+```
+
+### 4. Configuration
+Create a `.env` file by copying the example:
+
+```bash
+cp .env.example .env
+```
+
+Edit the `.env` file and provide your wallet details if you intend to trade live:
+
+```env
+POLY_PRIVATE_KEY=0xYourPrivateKey
+POLY_WALLET_ADDRESS=0xYourWalletAddress
+PROFIT_THRESHOLD=0.01
+BET_SIZE_SHARES=1.0
+```
+
+---
+
+## 🚦 How to Run
+
+### CLI Mode (Monitoring & Trading)
+
+**Scan once:**
+```bash
+python main.py --condition_id <MARKET_ID> --mode scan
+```
+
+**Run Paper Trading (Loop):**
+```bash
+python main.py --condition_id <MARKET_ID> --mode paper
+```
+
+**Run Live Trading (with confirmation):**
+```bash
+python main.py --condition_id <MARKET_ID> --mode live --confirm
+```
+
+### Web UI Mode
+
+Launch the interactive dashboard:
+```bash
+streamlit run ui.py
+```
+
+---
+
+## ⚠️ Risk Warning
+
+- **Slippage**: Market prices may change between detection and execution.
+- **Execution Risk**: Partial fills can break the arbitrage strategy.
+- **Liquidity**: Ensure the market has enough liquidity for your bet size.
+- **No Financial Advice**: This bot is for educational and research purposes only. Use at your own risk.
