@@ -134,6 +134,62 @@ def fetch_active_markets(query: str = "", limit: int = 200) -> list[dict]:
         return []
 
 
+_SPORTS_KEYWORDS = {
+    "sport", "esport", "esports", "e-sport", "football", "soccer", "basketball",
+    "baseball", "hockey", "tennis", "cricket", "rugby", "golf", "boxing", "mma",
+    "ufc", "wrestling", "racing", "nfl", "nba", "nhl", "mlb", "fifa", "dota",
+    "league of legends", "cs:go", "csgo", "valorant", "overwatch",
+    "counter-strike", "starcraft",
+}
+
+_SPORTS_TITLE_HINTS = [
+    "vs team", "og vs", "team spirit", "team liquid", "team secret",
+]
+
+
+def _is_sports_event(ev: dict, market: dict, title: str) -> bool:
+    """Return True jika event ini adalah Sports/Esports — harus di-skip."""
+    def _contains_sport(text: str) -> bool:
+        t = text.lower()
+        return any(kw in t for kw in _SPORTS_KEYWORDS)
+
+    # 1. Cek field 'category' (bisa string atau dict)
+    for src in [ev, market]:
+        cat = src.get("category")
+        if isinstance(cat, str) and _contains_sport(cat):
+            return True
+        if isinstance(cat, dict):
+            for v in cat.values():
+                if isinstance(v, str) and _contains_sport(v):
+                    return True
+        # 2. Cek categorySlug
+        slug = src.get("categorySlug") or ""
+        if isinstance(slug, str) and _contains_sport(slug):
+            return True
+
+    # 3. Cek tags (list of str atau list of dict)
+    for src in [ev, market]:
+        tags = src.get("tags") or []
+        if not isinstance(tags, list):
+            continue
+        for tag in tags:
+            if isinstance(tag, str) and _contains_sport(tag):
+                return True
+            if isinstance(tag, dict):
+                for v in tag.values():
+                    if isinstance(v, str) and _contains_sport(v):
+                        return True
+
+    # 4. Fallback: cek judul event mengandung keyword sports/esports
+    if _contains_sport(title):
+        return True
+    tl = title.lower()
+    if any(hint in tl for hint in _SPORTS_TITLE_HINTS):
+        return True
+
+    return False
+
+
 def group_markets_by_event(markets: list[dict], query: str = "") -> dict[str, dict]:
     """
     Kelompokkan markets berdasarkan parent event (dari field events[0].id).
@@ -157,6 +213,10 @@ def group_markets_by_event(markets: list[dict], query: str = "") -> dict[str, di
         if not ev_id:
             continue
 
+        # Skip kategori Sports / Esports (cek category, categorySlug, tags, dan title)
+        if _is_sports_event(events_field[0] if events_field else {}, m, ev_title):
+            continue
+
         # Client-side filter teks
         if q:
             haystack = (ev_title + " " + m.get("question", "")).lower()
@@ -175,12 +235,30 @@ def group_markets_by_event(markets: list[dict], query: str = "") -> dict[str, di
         groups[ev_id]["volume24h"] = max(
             groups[ev_id]["volume24h"], m.get("volume24hr", 0)
         )
-        # Simpan endDate terbaru (terlama) dalam grup
         if m.get("endDate", "") > groups[ev_id]["end_date"]:
             groups[ev_id]["end_date"] = m.get("endDate", "")
 
     # Hanya event multi-outcome (≥2 binary market)
-    return {k: v for k, v in groups.items() if len(v["markets"]) >= 2}
+    result = {k: v for k, v in groups.items() if len(v["markets"]) >= 2}
+
+    # Hitung sum YES probability untuk deteksi mutually-exclusive vs independent
+    for ev_data in result.values():
+        sum_yes = 0.0
+        counted = 0
+        for m in ev_data["markets"]:
+            prices = _parse_json_field(m.get("outcomePrices"), [])
+            if prices:
+                try:
+                    sum_yes += float(prices[0])   # prices[0] = YES probability
+                    counted += 1
+                except (ValueError, TypeError):
+                    pass
+        ev_data["sum_yes_prob"]   = sum_yes
+        # Mutually exclusive: sum YES ≈ 1.0 (threshold 1.3 memberi ruang spread)
+        # Independent (Bitcoin above X): sum YES bisa 1.5–3.0+
+        ev_data["is_categorical"] = (counted == 0) or (sum_yes <= 1.3)
+
+    return result
 
 
 # ─────────────────────────────────────────────

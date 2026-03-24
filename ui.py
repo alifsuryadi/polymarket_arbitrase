@@ -65,6 +65,8 @@ for k, v in [
     ("current_result",    None),
     ("event_title",       ""),
     ("event_slug",        ""),
+    ("scanner_results",   []),
+    ("scanner_done",      False),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -232,8 +234,15 @@ with st.sidebar:
             key="search_input",
         )
 
+        only_categorical = st.toggle("Hanya mutually exclusive", value=True,
+                                     help="Sembunyikan market seperti 'Bitcoin above $X' yang beberapa YES-nya bisa menang bersamaan")
+
         with st.spinner("Memuat data..."):
             grouped = get_grouped_markets(search_query)
+
+        # Filter: hanya tampilkan event yang mutually exclusive jika toggle aktif
+        if only_categorical:
+            grouped = {k: v for k, v in grouped.items() if v.get("is_categorical", True)}
 
         if grouped:
             # Sort berdasarkan volume24h tertinggi
@@ -334,8 +343,158 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-if not condition_id:
-    st.markdown("""
+main_tab_scanner, main_tab_market = st.tabs(["📡 Scanner Massal", "🎯 Market Terpilih"])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 1 — SCANNER MASSAL
+# ══════════════════════════════════════════════════════════════════════════════
+with main_tab_scanner:
+    st.markdown("#### Scan semua event aktif dan tampilkan mana yang ada peluang arbitrase")
+
+    col_btn, col_info = st.columns([1, 3])
+    with col_btn:
+        max_events  = st.number_input("Maks event discan", 5, 100, 40, step=5)
+        scan_all_btn = st.button("🔍 Mulai Scanner", type="primary", use_container_width=True)
+        if st.button("🗑️ Hapus Hasil", use_container_width=True):
+            st.session_state.scanner_results = []
+            st.session_state.scanner_done    = False
+            st.rerun()
+    with col_info:
+        if st.session_state.scanner_done:
+            n_opp = sum(1 for r in st.session_state.scanner_results if r["has_opportunity"])
+            st.success(f"✅ Selesai — {len(st.session_state.scanner_results)} event discan, "
+                       f"**{n_opp} opportunity** ditemukan")
+        else:
+            st.info("Klik **Mulai Scanner** untuk scan semua event aktif sekaligus.")
+
+    if scan_all_btn:
+        st.session_state.scanner_results = []
+        st.session_state.scanner_done    = False
+
+        with st.spinner("Mengambil daftar event aktif..."):
+            raw_markets = _cached_markets(500)
+            all_groups  = group_markets_by_event(raw_markets)
+            # Hanya event mutually exclusive (sum YES ≈ 1.0)
+            categorical = {k: v for k, v in all_groups.items() if v.get("is_categorical", True)}
+            sorted_groups = sorted(
+                categorical.items(),
+                key=lambda x: x[1]["volume24h"], reverse=True
+            )[:int(max_events)]
+
+        progress_bar  = st.progress(0, text="Memulai scan...")
+        status_slot   = st.empty()
+        results_slot  = st.empty()
+
+        scan_results: list[dict] = []
+        total = len(sorted_groups)
+
+        for i, (ev_id, ev_data) in enumerate(sorted_groups):
+            title = ev_data["title"][:70]
+            progress_bar.progress((i + 1) / total,
+                                  text=f"[{i+1}/{total}] {title}")
+            status_slot.caption(f"Scanning: **{title}**")
+
+            try:
+                cid = ev_data["markets"][0].get("conditionId", "")
+                if not cid:
+                    continue
+                minfo = build_market_info(
+                    markets=ev_data["markets"],
+                    event_title=ev_data["title"],
+                    event_slug=ev_data["slug"],
+                    condition_id=cid,
+                )
+                if not minfo.outcomes:
+                    continue
+                no_r, yes_r = check_arbitrage(cid, market_info=minfo)
+                best_profit = max(no_r.net_profit, yes_r.net_profit)
+                best_strat  = "NO" if no_r.net_profit >= yes_r.net_profit else "YES"
+                best_roi    = no_r.roi_pct if best_strat == "NO" else yes_r.roi_pct
+                scan_results.append({
+                    "title":           ev_data["title"],
+                    "slug":            ev_data["slug"],
+                    "n_outcomes":      len(minfo.outcomes),
+                    "best_profit":     best_profit,
+                    "best_roi":        best_roi,
+                    "best_strategy":   best_strat,
+                    "no_profit":       no_r.net_profit,
+                    "yes_profit":      yes_r.net_profit,
+                    "has_opportunity": no_r.is_opportunity or yes_r.is_opportunity,
+                    "volume24h":       ev_data["volume24h"],
+                    "condition_id":    cid,
+                    "sum_yes":         ev_data.get("sum_yes_prob", 0),
+                })
+            except Exception:
+                pass
+
+        progress_bar.empty()
+        status_slot.empty()
+        st.session_state.scanner_results = sorted(
+            scan_results, key=lambda x: (x["has_opportunity"], x["best_profit"]), reverse=True
+        )
+        st.session_state.scanner_done = True
+        st.rerun()
+
+    # Tampilkan hasil scanner
+    if st.session_state.scanner_results:
+        rows = []
+        for r in st.session_state.scanner_results:
+            opp_badge = "🚨 OPPORTUNITY" if r["has_opportunity"] else "—"
+            vol_s     = f"${r['volume24h']/1000:.0f}k" if r['volume24h'] >= 1000 else f"${r['volume24h']:.0f}"
+            link_html = f"[↗]({polymarket_url(r['slug'])})" if r["slug"] else ""
+            rows.append({
+                "Status":       opp_badge,
+                "Event":        r["title"][:65],
+                "Outcomes":     r["n_outcomes"],
+                "Σ YES prob":   f"{r.get('sum_yes', 0):.2f}",
+                "Strategi":     f"Buy All {r['best_strategy']}",
+                "Net Profit":   f"${r['best_profit']:.3f}",
+                "ROI":          f"{r['best_roi']:.2f}%",
+                "Vol 24h":      vol_s,
+                "Link":         polymarket_url(r["slug"]) if r["slug"] else "",
+            })
+
+        df = pd.DataFrame(rows)
+        st.dataframe(
+            df,
+            column_config={
+                "Link": st.column_config.LinkColumn("Link", display_text="↗ Buka"),
+            },
+            width="stretch",
+            hide_index=True,
+        )
+
+        # Highlight opportunities secara terpisah
+        opps = [r for r in st.session_state.scanner_results if r["has_opportunity"]]
+        if opps:
+            st.markdown("---")
+            st.markdown(f"### 🚨 {len(opps)} Opportunity Ditemukan")
+            for r in opps:
+                link = polymarket_url(r["slug"])
+                st.markdown(
+                    f'<div class="opp">'
+                    f'<b>{r["title"][:80]}</b><br>'
+                    f'<span style="font-size:.85rem">'
+                    f'Buy All <b>{r["best_strategy"]}</b> &nbsp;|&nbsp; '
+                    f'Net Profit: <b>${r["best_profit"]:.3f}</b> &nbsp;|&nbsp; '
+                    f'ROI: <b>{r["best_roi"]:.2f}%</b> &nbsp;|&nbsp; '
+                    f'<a href="{link}" target="_blank">🔗 Buka di Polymarket ↗</a>'
+                    f'</span></div>',
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.markdown('<div class="nopp">⏳ Tidak ada peluang arbitrase di semua event yang discan.</div>',
+                        unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 2 — MARKET TERPILIH
+# ══════════════════════════════════════════════════════════════════════════════
+with main_tab_market:
+
+    if not condition_id:
+        st.markdown("""
 <div class="nopp" style="text-align:center;padding:30px">
   <div style="font-size:2rem">🎯</div>
   <div style="color:#e2e4f0;margin-top:8px">Cari &amp; pilih event di sidebar untuk mulai</div>
@@ -344,56 +503,51 @@ if not condition_id:
   </div>
 </div>
 """, unsafe_allow_html=True)
-    st.stop()
+    else:
+
+        # ── Scan ──────────────────────────────────────────────────────────────
+        def do_scan():
+            with st.spinner("Mengambil data orderbook real-time..."):
+                try:
+                    no_result, yes_result = check_arbitrage(condition_id, market_info=market_info_override)
+                    st.session_state.current_result = (no_result, yes_result)
+                    st.session_state.scan_history.insert(0, {
+                        "time":       time.strftime("%H:%M:%S"),
+                        "no_profit":  no_result.net_profit,
+                        "yes_profit": yes_result.net_profit,
+                        "no_opp":     no_result.is_opportunity,
+                        "yes_opp":    yes_result.is_opportunity,
+                    })
+                    st.session_state.scan_history = st.session_state.scan_history[:30]
+                    if mode == "paper":
+                        for r in (no_result, yes_result):
+                            if r.is_opportunity:
+                                simulate_trade(r, st.session_state.portfolio)
+                    return no_result, yes_result
+                except Exception as e:
+                    st.error(f"❌ Error: {e}")
+                    return None
 
 
-# ─── Scan ─────────────────────────────────────────────────────────────────────
-def do_scan():
-    with st.spinner("Mengambil data orderbook real-time..."):
-        try:
-            no_result, yes_result = check_arbitrage(condition_id, market_info=market_info_override)
-            st.session_state.current_result = (no_result, yes_result)
-            st.session_state.scan_history.insert(0, {
-                "time":       time.strftime("%H:%M:%S"),
-                "no_profit":  no_result.net_profit,
-                "yes_profit": yes_result.net_profit,
-                "no_opp":     no_result.is_opportunity,
-                "yes_opp":    yes_result.is_opportunity,
-            })
-            st.session_state.scan_history = st.session_state.scan_history[:30]
-            if mode == "paper":
-                for r in (no_result, yes_result):
-                    if r.is_opportunity:
-                        simulate_trade(r, st.session_state.portfolio)
-            return no_result, yes_result
-        except Exception as e:
-            st.error(f"❌ Error: {e}")
-            return None
+        if scan_btn:
+            result_pair = do_scan()
+        elif st.session_state.current_result:
+            result_pair = st.session_state.current_result
+        else:
+            result_pair = None
 
 
-if scan_btn:
-    result_pair = do_scan()
-elif st.session_state.current_result:
-    result_pair = st.session_state.current_result
-else:
-    result_pair = None
+        # ── Tampilkan hasil ────────────────────────────────────────────────────
+        if result_pair:
+            no_result, yes_result = result_pair
+            last_t  = st.session_state.scan_history[0]["time"] if st.session_state.scan_history else "—"
+            n_valid = sum(1 for op in no_result.outcome_prices if op.no_ask is not None)
 
+            display_title = st.session_state.event_title or no_result.market.question
+            display_slug  = st.session_state.event_slug or no_result.market.event_slug
+            link = polymarket_url(display_slug)
 
-# ─── Tampilkan hasil ──────────────────────────────────────────────────────────
-if result_pair:
-    no_result, yes_result = result_pair
-    last_t  = st.session_state.scan_history[0]["time"] if st.session_state.scan_history else "—"
-    n_valid = sum(1 for op in no_result.outcome_prices if op.no_ask is not None)
-
-    # Judul: gunakan event title yang tersimpan, atau dari hasil scan
-    display_title = (
-        st.session_state.event_title
-        or no_result.market.question
-    )
-    display_slug = st.session_state.event_slug or no_result.market.event_slug
-    link = polymarket_url(display_slug)
-
-    st.markdown(f"""
+            st.markdown(f"""
 <div class="mcard">
   <h3>{display_title}</h3>
   <div class="meta">
@@ -405,47 +559,45 @@ if result_pair:
 </div>
 """, unsafe_allow_html=True)
 
-    opps = [r for r in (no_result, yes_result) if r.is_opportunity]
-    if opps:
-        best = max(opps, key=lambda r: r.net_profit)
-        st.markdown(f'<div class="opp">🚨 <b>OPPORTUNITY FOUND!</b> &nbsp; Buy All <b>{best.strategy}</b> &nbsp;|&nbsp; Net: <b>${best.net_profit:.2f}</b> &nbsp;|&nbsp; ROI: <b>{best.roi_pct:.2f}%</b></div>',
-                    unsafe_allow_html=True)
-    elif n_valid == 0:
-        st.markdown(f"""
+            opps = [r for r in (no_result, yes_result) if r.is_opportunity]
+            if opps:
+                best = max(opps, key=lambda r: r.net_profit)
+                st.markdown(f'<div class="opp">🚨 <b>OPPORTUNITY FOUND!</b> &nbsp; Buy All <b>{best.strategy}</b> &nbsp;|&nbsp; Net: <b>${best.net_profit:.2f}</b> &nbsp;|&nbsp; ROI: <b>{best.roi_pct:.2f}%</b></div>',
+                            unsafe_allow_html=True)
+            elif n_valid == 0:
+                st.markdown("""
 <div class="warn">
   ⚠️ <b>Semua token 404 — orderbook tidak aktif.</b><br>
-  Market ini kemungkinan <b>sudah expired atau belum ada liquidity</b>.
-  Cari event yang lebih baru di sidebar (contoh: tambahkan tanggal lebih jauh seperti
-  <code>elon musk march 31</code> atau <code>elon musk april</code>).
+  Cari event yang lebih baru di sidebar.
 </div>
 """, unsafe_allow_html=True)
-    else:
-        st.markdown('<div class="nopp">⏳ Tidak ada peluang arbitrase saat ini.</div>', unsafe_allow_html=True)
+            else:
+                st.markdown('<div class="nopp">⏳ Tidak ada peluang arbitrase saat ini.</div>', unsafe_allow_html=True)
 
-    tab_no, tab_yes, tab_port, tab_hist = st.tabs([
-        "📉 Buy All NO", "📈 Buy All YES", "💼 Portfolio", "📋 Riwayat"
-    ])
-    with tab_no:
-        render_result_card(no_result)
-    with tab_yes:
-        render_result_card(yes_result)
-    with tab_port:
-        render_portfolio(st.session_state.portfolio)
-    with tab_hist:
-        if st.session_state.scan_history:
-            rows = [{
-                "#":       len(st.session_state.scan_history) - i,
-                "Waktu":   h["time"],
-                "NO":      f"${h['no_profit']:.2f} {'✅' if h['no_opp'] else '—'}",
-                "YES":     f"${h['yes_profit']:.2f} {'✅' if h['yes_opp'] else '—'}",
-                "Peluang": "✅ YA" if (h["no_opp"] or h["yes_opp"]) else "—",
-            } for i, h in enumerate(st.session_state.scan_history)]
-            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+            tab_no, tab_yes, tab_port, tab_hist = st.tabs([
+                "📉 Buy All NO", "📈 Buy All YES", "💼 Portfolio", "📋 Riwayat"
+            ])
+            with tab_no:
+                render_result_card(no_result)
+            with tab_yes:
+                render_result_card(yes_result)
+            with tab_port:
+                render_portfolio(st.session_state.portfolio)
+            with tab_hist:
+                if st.session_state.scan_history:
+                    hist_rows = [{
+                        "#":       len(st.session_state.scan_history) - i,
+                        "Waktu":   h["time"],
+                        "NO":      f"${h['no_profit']:.2f} {'✅' if h['no_opp'] else '—'}",
+                        "YES":     f"${h['yes_profit']:.2f} {'✅' if h['yes_opp'] else '—'}",
+                        "Peluang": "✅ YA" if (h["no_opp"] or h["yes_opp"]) else "—",
+                    } for i, h in enumerate(st.session_state.scan_history)]
+                    st.dataframe(pd.DataFrame(hist_rows), width="stretch", hide_index=True)
+                else:
+                    st.caption("Belum ada riwayat.")
         else:
-            st.caption("Belum ada riwayat.")
-else:
-    st.markdown('<div class="nopp" style="text-align:center;padding:24px">Tekan <b>🔍 Scan Sekarang</b> di sidebar untuk memulai.</div>',
-                unsafe_allow_html=True)
+            st.markdown('<div class="nopp" style="text-align:center;padding:24px">Tekan <b>🔍 Scan Sekarang</b> di sidebar untuk memulai.</div>',
+                        unsafe_allow_html=True)
 
 # ─── Auto-refresh ─────────────────────────────────────────────────────────────
 if auto_refresh and condition_id:
