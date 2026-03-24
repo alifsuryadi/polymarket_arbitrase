@@ -8,7 +8,7 @@ import streamlit as st
 import pandas as pd
 
 from arbitrage import check_arbitrage
-from api_client import fetch_active_markets, group_markets_by_event, build_market_info, MarketInfo
+from api_client import fetch_active_markets, group_markets_by_event, build_market_info, get_market_info, MarketInfo
 from paper_trade import PaperPortfolio, simulate_trade
 from config import POLL_INTERVAL_SECONDS, PROFIT_THRESHOLD, BET_SIZE_SHARES
 
@@ -88,17 +88,17 @@ def _search_markets(query: str, limit: int) -> list[dict]:
 def get_grouped_markets(query: str) -> dict[str, dict]:
     """
     Grouping + search.
-    Jika ada query: gabungkan hasil server-search (limit 500) + top-200 umum,
-    lalu filter client-side. Ini memastikan market populer (trump, dll) tetap
-    muncul meski server-search API tidak mengembalikan semua sub-market.
+    Jika ada query: gabungkan hasil server-search (limit 1000) + top-200 umum,
+    lalu filter client-side. Gunakan min_markets=1 saat ada query agar market
+    langka (volume rendah) tetap muncul meskipun sibling-nya tidak ikut terfetch.
     """
     if query.strip():
-        search_res = _search_markets(query.strip(), 500)
+        search_res = _search_markets(query.strip(), 1000)
         general    = _cached_markets(200)
         # Merge — server search duluan, tambahkan dari general yang belum ada
         seen   = {m.get("conditionId") for m in search_res if m.get("conditionId")}
         merged = search_res + [m for m in general if m.get("conditionId") not in seen]
-        return group_markets_by_event(merged, query=query)
+        return group_markets_by_event(merged, query=query, min_markets=1)
     else:
         return group_markets_by_event(_cached_markets(200))
 
@@ -284,16 +284,30 @@ with st.sidebar:
 
             if condition_id:
                 n_out = len(selected_group["markets"])
-                st.success(f"✅ {n_out} outcome ditemukan")
                 st.code(condition_id[:42], language=None)
-                # Build MarketInfo langsung dari data yang sudah kita punya
-                # → hindari re-fetch sibling yang bisa salah market
-                market_info_override = build_market_info(
-                    markets=selected_group["markets"],
-                    event_title=ev_title_local,
-                    event_slug=ev_slug_local,
-                    condition_id=condition_id,
-                )
+                if n_out >= 2:
+                    # Sudah punya ≥2 sibling dari hasil fetch — langsung build
+                    st.success(f"✅ {n_out} outcome ditemukan")
+                    market_info_override = build_market_info(
+                        markets=selected_group["markets"],
+                        event_title=ev_title_local,
+                        event_slug=ev_slug_local,
+                        condition_id=condition_id,
+                    )
+                else:
+                    # Hanya 1 market terfetch (volume rendah / pencarian parsial)
+                    # → Fetch sibling dari API berdasarkan condition_id
+                    with st.spinner("Mengambil sibling markets dari API..."):
+                        try:
+                            market_info_override = get_market_info(condition_id)
+                            n_fetched = len(market_info_override.outcomes)
+                            if n_fetched >= 2:
+                                st.success(f"✅ {n_fetched} outcome ditemukan (via API)")
+                            else:
+                                st.warning(f"⚠️ Hanya {n_fetched} outcome — market mungkin belum aktif")
+                        except Exception as _e:
+                            st.error(f"Gagal fetch sibling: {_e}")
+                            market_info_override = None
         else:
             if search_query:
                 st.warning(f'Tidak ada hasil untuk "{search_query}"')

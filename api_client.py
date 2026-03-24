@@ -190,10 +190,15 @@ def _is_sports_event(ev: dict, market: dict, title: str) -> bool:
     return False
 
 
-def group_markets_by_event(markets: list[dict], query: str = "") -> dict[str, dict]:
+def group_markets_by_event(
+    markets: list[dict],
+    query: str = "",
+    min_markets: int = 2,
+) -> dict[str, dict]:
     """
     Kelompokkan markets berdasarkan parent event (dari field events[0].id).
-    Hanya tampilkan event dengan 2+ binary market yang masih aktif.
+    Hanya tampilkan event dengan min_markets+ binary market yang masih aktif.
+    Default min_markets=2; set ke 1 saat search mode agar market langka tetap muncul.
     """
     q = query.strip().lower()
 
@@ -238,8 +243,8 @@ def group_markets_by_event(markets: list[dict], query: str = "") -> dict[str, di
         if m.get("endDate", "") > groups[ev_id]["end_date"]:
             groups[ev_id]["end_date"] = m.get("endDate", "")
 
-    # Hanya event multi-outcome (≥2 binary market)
-    result = {k: v for k, v in groups.items() if len(v["markets"]) >= 2}
+    # Filter: minimal min_markets binary market per event
+    result = {k: v for k, v in groups.items() if len(v["markets"]) >= min_markets}
 
     # Hitung sum YES probability untuk deteksi mutually-exclusive vs independent
     for ev_data in result.values():
