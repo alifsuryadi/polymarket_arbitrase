@@ -49,8 +49,8 @@ This strategy is used when the sum of the 'YES' prices for all outcomes is less 
 Clone the repository and install the required Python packages:
 
 ```bash
-git clone https://github.com/alifsuryadi/polymarket_arbitrase.git
-cd polymarket_arbitrase
+git clone https://github.com/alifsuryadi/polymarket_arbitrage.git
+cd polymarket_arbitrage
 pip install -r requirements.txt
 ```
 
